@@ -1,0 +1,640 @@
+//@version=6
+// ============================================================================
+//  ICT POI MODEL — NQ / ES  (indicator only, no trade execution)
+//
+//  Detects: HTF bias (4H/1H), significant swings, inducement (engulfing
+//  required), real BOS, displacement, order blocks, fair value gaps,
+//  POI entries/reactions, ICT kill zones, and full valid-setup sequences.
+//
+//  Design note: structure, POIs and signals are computed on the CHART
+//  timeframe (enable/disable each TF below). Only the 4H / 1H bias is pulled
+//  from higher timeframes (non-repainting, last confirmed HTF bar). View the
+//  5m/15m/30m chart for structure POIs, 1m/3m for entry signals — the
+//  dashboard shows HTF bias on every timeframe.
+// ============================================================================
+indicator("ICT POI Model [NQ/ES]", shorttitle = "ICT POI", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// ============================================================================
+// SECTION 1 — INPUTS
+// ============================================================================
+
+// ── Timeframes ──────────────────────────────────────────────────────────────
+grpTF = "Timeframes"
+use4H      = input.bool(true, "Use 4H higher-timeframe bias",   group = grpTF)
+use1H      = input.bool(true, "Use 1H higher-timeframe bias",   group = grpTF)
+allow1     = input.bool(true, "Enable signals on 1m chart",     group = grpTF)
+allow3     = input.bool(true, "Enable signals on 3m chart",     group = grpTF)
+allow5     = input.bool(true, "Enable signals on 5m chart",     group = grpTF)
+allow15    = input.bool(true, "Enable signals on 15m chart",    group = grpTF)
+allow30    = input.bool(true, "Enable signals on 30m chart",    group = grpTF)
+allowOther = input.bool(true, "Enable signals on other charts", group = grpTF)
+
+// ── Structure / pivots ──────────────────────────────────────────────────────
+grpStr = "Structure"
+pivotLeft  = input.int(3, "Pivot left candles",  minval = 1, group = grpStr)
+pivotRight = input.int(3, "Pivot right candles", minval = 1, group = grpStr)
+
+// ── Engulfing ───────────────────────────────────────────────────────────────
+grpEng = "Engulfing"
+engulfType = input.string("Body", "Engulfing definition",
+     options = ["Body", "Full candle (incl. wicks)"], group = grpEng)
+
+// ── Break of Structure ──────────────────────────────────────────────────────
+grpBos = "Break of Structure"
+bosConfirm = input.string("Candle body close", "BOS confirmation type",
+     options = ["Candle body close", "Full candle close", "Wick break"], group = grpBos)
+bosWindow  = input.int(20, "BOS window after inducement (candles)", minval = 1, group = grpBos)
+bosNeedsDisp = input.bool(true, "Require displacement for BOS",
+     tooltip = "Displacement must appear on the break candle or one of the 2 candles before it.",
+     group = grpBos)
+
+// ── Displacement ────────────────────────────────────────────────────────────
+grpDisp = "Displacement"
+dispMult  = input.float(1.5, "Displacement multiplier", minval = 0.5, step = 0.1, group = grpDisp)
+dispBasis = input.string("Body average", "Displacement basis",
+     options = ["Body average", "ATR"], group = grpDisp)
+dispLen   = input.int(14, "Displacement average length", minval = 2, group = grpDisp)
+
+// ── Order blocks / FVGs ─────────────────────────────────────────────────────
+grpPoi = "POIs (Order Blocks & FVGs)"
+obLookback   = input.int(3, "Order block max candles in series", minval = 1, maxval = 10, group = grpPoi)
+usePoiExpiry = input.bool(true, "Use POI expiration", group = grpPoi)
+poiExpiry    = input.int(100, "POI expiration (candles)", minval = 10, group = grpPoi)
+invalidMode  = input.string("Fade", "Invalidated POI display",
+     options = ["Fade", "Delete"], group = grpPoi)
+
+// ── Kill zones (New York time) ──────────────────────────────────────────────
+grpKZ = "ICT Kill Zones (New York time)"
+useKZFilter = input.bool(true, "Use Kill-Zone Filter", group = grpKZ)
+showKZBg    = input.bool(true, "Highlight kill zones on chart", group = grpKZ)
+sessAsia    = input.session("2000-0000", "Asia session",    group = grpKZ)
+sessLondon  = input.session("0200-0500", "London session",  group = grpKZ)
+sessNYAM    = input.session("0830-1300", "New York AM",     group = grpKZ)
+sessNYPM    = input.session("1330-1600", "New York PM",     group = grpKZ)
+
+// ── Mode ────────────────────────────────────────────────────────────────────
+grpMode = "Mode"
+aggressiveMode = input.bool(false, "Aggressive Mode (allow setups during mixed bias)", group = grpMode)
+
+// ── Display ─────────────────────────────────────────────────────────────────
+grpDisp2 = "Display"
+showOB       = input.bool(true, "Show order blocks",        group = grpDisp2)
+showFVG      = input.bool(true, "Show fair value gaps",     group = grpDisp2)
+showBOSLines = input.bool(true, "Show BOS lines & labels",  group = grpDisp2)
+showIndMarks = input.bool(true, "Show inducement marks",    group = grpDisp2)
+showLiqLines = input.bool(true, "Show swept liquidity lines", group = grpDisp2)
+showLabels   = input.bool(true, "Show signal labels",       group = grpDisp2)
+showDash     = input.bool(true, "Show dashboard",           group = grpDisp2)
+showDev      = input.bool(false, "Show developing structure", group = grpDisp2)
+maxBoxesIn   = input.int(60, "Maximum boxes",  minval = 5, maxval = 450, group = grpDisp2)
+maxLabelsIn  = input.int(60, "Maximum labels", minval = 5, maxval = 450, group = grpDisp2)
+maxLinesIn   = input.int(60, "Maximum lines",  minval = 5, maxval = 450, group = grpDisp2)
+
+// ── Colors ──────────────────────────────────────────────────────────────────
+COL_BULL     = color.new(color.teal,   0)
+COL_BEAR     = color.new(color.red,    0)
+COL_OB_BULL  = color.new(color.teal,   82)
+COL_OB_BEAR  = color.new(color.red,    82)
+COL_FVG_BULL = color.new(color.blue,   85)
+COL_FVG_BEAR = color.new(color.orange, 85)
+COL_FADE     = color.new(color.gray,   92)
+COL_DEV      = color.new(color.gray,   40)
+
+// ============================================================================
+// SECTION 2 — CHART-TIMEFRAME GATE & HELPERS
+// ============================================================================
+
+// Signals only generate on timeframes the user has enabled.
+tfOk = switch timeframe.period
+    "1"  => allow1
+    "3"  => allow3
+    "5"  => allow5
+    "15" => allow15
+    "30" => allow30
+    => allowOther
+
+// All signals confirm on candle close only (repaint protection).
+confirmed = barstate.isconfirmed
+
+// Drawing-object registries so old objects can be trimmed to the user limits.
+var sigLabels = array.new<label>()
+var sigLines  = array.new<line>()
+
+f_addLabel(label l) =>
+    array.push(sigLabels, l)
+    while array.size(sigLabels) > maxLabelsIn
+        label.delete(array.shift(sigLabels))
+
+f_addLine(line l) =>
+    array.push(sigLines, l)
+    while array.size(sigLines) > maxLinesIn
+        line.delete(array.shift(sigLines))
+
+// ============================================================================
+// SECTION 3 — HIGHER-TIMEFRAME BIAS (4H primary, 1H secondary)
+// ============================================================================
+// Bias flips on a confirmed structural break of the last pivot high/low on
+// the higher timeframe. Pulled with [1] + lookahead_on = last CONFIRMED HTF
+// bar only, so the bias does not repaint intrabar.
+f_biasDir() =>
+    _ph = ta.pivothigh(pivotLeft, pivotRight)
+    _pl = ta.pivotlow(pivotLeft, pivotRight)
+    var float _hi = na
+    var float _lo = na
+    var int   _dir = 0
+    if not na(_ph)
+        _hi := _ph
+    if not na(_pl)
+        _lo := _pl
+    if not na(_hi) and close > _hi
+        _dir := 1
+        _hi := na
+    if not na(_lo) and close < _lo
+        _dir := -1
+        _lo := na
+    _dir
+
+bias4H = use4H ? request.security(syminfo.tickerid, "240", f_biasDir()[1], lookahead = barmerge.lookahead_on) : 0
+bias1H = use1H ? request.security(syminfo.tickerid, "60",  f_biasDir()[1], lookahead = barmerge.lookahead_on) : 0
+
+// Combined bias: both bullish -> Bullish, both bearish -> Bearish, else Mixed.
+combinedBias = use4H and use1H ?
+     (bias4H == 1 and bias1H == 1 ? 1 : bias4H == -1 and bias1H == -1 ? -1 : 0) :
+     use4H ? bias4H : use1H ? bias1H : 0
+
+f_biasTxt(int b) => b == 1 ? "Bullish" : b == -1 ? "Bearish" : "Mixed"
+f_biasCol(int b) => b == 1 ? COL_BULL : b == -1 ? COL_BEAR : color.gray
+
+// ============================================================================
+// SECTION 4 — KILL ZONES (New York time)
+// ============================================================================
+inAsia   = not na(time(timeframe.period, sessAsia,   "America/New_York"))
+inLondon = not na(time(timeframe.period, sessLondon, "America/New_York"))
+inNYAM   = not na(time(timeframe.period, sessNYAM,   "America/New_York"))
+inNYPM   = not na(time(timeframe.period, sessNYPM,   "America/New_York"))
+inAnyKZ  = inAsia or inLondon or inNYAM or inNYPM
+
+f_kzName() =>
+    inNYAM ? "NY AM" : inNYPM ? "NY PM" : inLondon ? "London" : inAsia ? "Asia" : "Outside Kill Zone"
+
+bgcolor(showKZBg and inAsia   ? color.new(color.purple, 94) : na, title = "Asia KZ")
+bgcolor(showKZBg and inLondon ? color.new(color.blue,   94) : na, title = "London KZ")
+bgcolor(showKZBg and inNYAM   ? color.new(color.green,  94) : na, title = "NY AM KZ")
+bgcolor(showKZBg and inNYPM   ? color.new(color.orange, 94) : na, title = "NY PM KZ")
+
+// ============================================================================
+// SECTION 5 — DISPLACEMENT
+// ============================================================================
+candleBody = math.abs(close - open)
+dispRef    = dispBasis == "ATR" ? ta.atr(dispLen) : ta.sma(candleBody, dispLen)
+isDispUp   = close > open and candleBody > dispMult * dispRef
+isDispDown = close < open and candleBody > dispMult * dispRef
+// BOS may be confirmed by displacement on the break candle or the 2 before it.
+dispUpNear   = isDispUp   or isDispUp[1]   or isDispUp[2]
+dispDownNear = isDispDown or isDispDown[1] or isDispDown[2]
+
+// ============================================================================
+// SECTION 6 — ENGULFING CANDLES
+// ============================================================================
+prevBodyTop = math.max(open[1], close[1])
+prevBodyBot = math.min(open[1], close[1])
+curBodyTop  = math.max(open, close)
+curBodyBot  = math.min(open, close)
+
+bullEngulf = engulfType == "Body" ?
+     close > open and curBodyTop >= prevBodyTop and curBodyBot <= prevBodyBot :
+     close > open and high >= high[1] and low <= low[1]
+bearEngulf = engulfType == "Body" ?
+     close < open and curBodyTop >= prevBodyTop and curBodyBot <= prevBodyBot :
+     close < open and high >= high[1] and low <= low[1]
+
+// ============================================================================
+// SECTION 7 — SIGNIFICANT SWINGS (pivot-based, confirmed after right candles)
+// ============================================================================
+ph = ta.pivothigh(pivotLeft, pivotRight)
+pl = ta.pivotlow(pivotLeft, pivotRight)
+
+var float swingHigh     = na      // most recent CONFIRMED significant swing high
+var int   swingHighBar  = na
+var bool  swingHighManip = false  // level was swept & rejected -> tainted for BOS
+var bool  swingHighIndUsed = false
+var float swingLow      = na
+var int   swingLowBar   = na
+var bool  swingLowManip = false
+var bool  swingLowIndUsed = false
+
+if not na(ph)
+    swingHigh        := ph
+    swingHighBar     := bar_index - pivotRight
+    swingHighManip   := false
+    swingHighIndUsed := false
+if not na(pl)
+    swingLow        := pl
+    swingLowBar     := bar_index - pivotRight
+    swingLowManip   := false
+    swingLowIndUsed := false
+
+// Optional developing-structure view: current tracked swing levels.
+plot(showDev ? swingHigh : na, "Developing swing high", COL_DEV, 1, plot.style_circles)
+plot(showDev ? swingLow  : na, "Developing swing low",  COL_DEV, 1, plot.style_circles)
+
+// ============================================================================
+// SECTION 8 — STATE, ALERT FLAGS
+// ============================================================================
+// Inducement / setup state machines
+var bool  bullIndActive = false   // confirmed bullish inducement, waiting for BOS
+var int   bullIndBar    = na
+var float pendBullLvl   = na      // swept low waiting for a bullish engulfing
+var int   pendBullBar   = na
+var bool  bearIndActive = false
+var int   bearIndBar    = na
+var float pendBearLvl   = na
+var int   pendBearBar   = na
+var int   bullArmedUntil = na     // POIs created before this bar belong to a bull setup
+var int   bearArmedUntil = na
+
+// Per-bar alert flags (consumed by alertcondition at the end of the script)
+bool aBullInd   = false
+bool aBearInd   = false
+bool aBullBos   = false
+bool aBearBos   = false
+bool aBullOB    = false
+bool aBearOB    = false
+bool aBullFVG   = false
+bool aBearFVG   = false
+bool aBullEnter = false
+bool aBearEnter = false
+bool aBullReact = false
+bool aBearReact = false
+bool aBullSetup = false
+bool aBearSetup = false
+bool aBullAggr  = false
+bool aBearAggr  = false
+
+// ============================================================================
+// SECTION 9 — INDUCEMENT (engulfing candle is mandatory)
+// ============================================================================
+if tfOk and confirmed
+    // ── Bullish inducement: sweep below swing low, bullish engulf, close back above
+    if not na(swingLow) and low < swingLow
+        if close > swingLow
+            swingLowManip := true                       // level swept -> no clean bearish BOS here
+            if bullEngulf and not swingLowIndUsed
+                bullIndActive    := true
+                bullIndBar       := bar_index
+                swingLowIndUsed  := true
+                pendBullLvl      := na
+                aBullInd         := true
+                if showIndMarks and showLabels
+                    f_addLabel(label.new(bar_index, low, "IND ▲", style = label.style_label_up,
+                         color = color.new(COL_BULL, 25), textcolor = color.white, size = size.small))
+                if showLiqLines
+                    f_addLine(line.new(swingLowBar, swingLow, bar_index, swingLow,
+                         color = COL_BULL, style = line.style_dashed))
+            else if not swingLowIndUsed
+                pendBullLvl := swingLow                 // swept, waiting for the engulfing
+                pendBullBar := bar_index
+    // Pending sweep: engulfing may confirm on a later candle
+    if not na(pendBullLvl)
+        if close < pendBullLvl or bar_index - pendBullBar > bosWindow
+            pendBullLvl := na                           // broke down or expired
+        else if bullEngulf and close > pendBullLvl
+            bullIndActive := true
+            bullIndBar    := bar_index
+            swingLowIndUsed := true
+            aBullInd      := true
+            if showIndMarks and showLabels
+                f_addLabel(label.new(bar_index, low, "IND ▲", style = label.style_label_up,
+                     color = color.new(COL_BULL, 25), textcolor = color.white, size = size.small))
+            if showLiqLines
+                f_addLine(line.new(swingLowBar, pendBullLvl, bar_index, pendBullLvl,
+                     color = COL_BULL, style = line.style_dashed))
+            pendBullLvl := na
+
+    // ── Bearish inducement: sweep above swing high, bearish engulf, close back below
+    if not na(swingHigh) and high > swingHigh
+        if close < swingHigh
+            swingHighManip := true
+            if bearEngulf and not swingHighIndUsed
+                bearIndActive     := true
+                bearIndBar        := bar_index
+                swingHighIndUsed  := true
+                pendBearLvl       := na
+                aBearInd          := true
+                if showIndMarks and showLabels
+                    f_addLabel(label.new(bar_index, high, "IND ▼", style = label.style_label_down,
+                         color = color.new(COL_BEAR, 25), textcolor = color.white, size = size.small))
+                if showLiqLines
+                    f_addLine(line.new(swingHighBar, swingHigh, bar_index, swingHigh,
+                         color = COL_BEAR, style = line.style_dashed))
+            else if not swingHighIndUsed
+                pendBearLvl := swingHigh
+                pendBearBar := bar_index
+    if not na(pendBearLvl)
+        if close > pendBearLvl or bar_index - pendBearBar > bosWindow
+            pendBearLvl := na
+        else if bearEngulf and close < pendBearLvl
+            bearIndActive := true
+            bearIndBar    := bar_index
+            swingHighIndUsed := true
+            aBearInd      := true
+            if showIndMarks and showLabels
+                f_addLabel(label.new(bar_index, high, "IND ▼", style = label.style_label_down,
+                     color = color.new(COL_BEAR, 25), textcolor = color.white, size = size.small))
+            if showLiqLines
+                f_addLine(line.new(swingHighBar, pendBearLvl, bar_index, pendBearLvl,
+                     color = COL_BEAR, style = line.style_dashed))
+            pendBearLvl := na
+
+    // Inducement expires if BOS does not occur within the allowed window
+    if bullIndActive and bar_index - bullIndBar > bosWindow
+        bullIndActive := false
+    if bearIndActive and bar_index - bearIndBar > bosWindow
+        bearIndActive := false
+
+// ============================================================================
+// SECTION 10 — REAL BREAK OF STRUCTURE
+// ============================================================================
+f_bosBreakUp(float lvl) =>
+    bosConfirm == "Candle body close" ? close > lvl :
+     bosConfirm == "Full candle close" ? curBodyBot > lvl :
+     high > lvl
+f_bosBreakDown(float lvl) =>
+    bosConfirm == "Candle body close" ? close < lvl :
+     bosConfirm == "Full candle close" ? curBodyTop < lvl :
+     low < lvl
+
+bool bullBosNow = false
+bool bearBosNow = false
+
+if tfOk and confirmed
+    // Bullish BOS: after confirmed bullish inducement, within the window,
+    // clean close above the most recent confirmed swing high (no prior sweep there).
+    if bullIndActive and not na(swingHigh) and not swingHighManip and
+         f_bosBreakUp(swingHigh) and (not bosNeedsDisp or dispUpNear)
+        bullBosNow := true
+        aBullBos   := true
+        if showBOSLines
+            f_addLine(line.new(swingHighBar, swingHigh, bar_index, swingHigh, color = COL_BULL, width = 2))
+            if showLabels
+                f_addLabel(label.new(bar_index, swingHigh, "BOS ▲", style = label.style_label_down,
+                     color = color.new(COL_BULL, 40), textcolor = color.white, size = size.small))
+        bullIndActive  := false
+        bullArmedUntil := bar_index + 10    // POIs formed by this leg belong to the setup
+        swingHigh      := na                // broken level consumed; wait for a new pivot
+
+    // Bearish BOS mirrors the bullish rules.
+    if bearIndActive and not na(swingLow) and not swingLowManip and
+         f_bosBreakDown(swingLow) and (not bosNeedsDisp or dispDownNear)
+        bearBosNow := true
+        aBearBos   := true
+        if showBOSLines
+            f_addLine(line.new(swingLowBar, swingLow, bar_index, swingLow, color = COL_BEAR, width = 2))
+            if showLabels
+                f_addLabel(label.new(bar_index, swingLow, "BOS ▼", style = label.style_label_up,
+                     color = color.new(COL_BEAR, 40), textcolor = color.white, size = size.small))
+        bearIndActive  := false
+        bearArmedUntil := bar_index + 10
+        swingLow       := na
+
+// ============================================================================
+// SECTION 11 — POI STORAGE (order blocks & fair value gaps)
+// ============================================================================
+// Parallel arrays: one entry per POI.  type: 1 bull OB, 2 bull FVG,
+// -1 bear OB, -2 bear FVG.  state: 0 active, 1 invalidated, 2 expired.
+var poiBox     = array.new<box>()
+var poiType    = array.new<int>()
+var poiTopA    = array.new<float>()
+var poiBotA    = array.new<float>()
+var poiBornA   = array.new<int>()
+var poiStateA  = array.new<int>()
+var poiSetupA  = array.new<bool>()   // belongs to an armed valid-setup sequence
+var poiTouchedA = array.new<bool>()
+var poiReactedA = array.new<bool>()
+
+f_poiRemove(int idx) =>
+    box.delete(array.get(poiBox, idx))
+    array.remove(poiBox, idx)
+    array.remove(poiType, idx)
+    array.remove(poiTopA, idx)
+    array.remove(poiBotA, idx)
+    array.remove(poiBornA, idx)
+    array.remove(poiStateA, idx)
+    array.remove(poiSetupA, idx)
+    array.remove(poiTouchedA, idx)
+    array.remove(poiReactedA, idx)
+
+f_poiAdd(int typ, float top, float bot, int leftBar, string txt, color bg, color border, bool isSetup) =>
+    b = box.new(leftBar, top, bar_index, bot, border_color = border,
+         border_width = isSetup ? 2 : 1, bgcolor = bg, text = txt,
+         text_color = color.new(border, 20), text_size = size.tiny,
+         text_halign = text.align_right, text_valign = text.align_center)
+    array.push(poiBox, b)
+    array.push(poiType, typ)
+    array.push(poiTopA, top)
+    array.push(poiBotA, bot)
+    array.push(poiBornA, bar_index)
+    array.push(poiStateA, 0)
+    array.push(poiSetupA, isSetup)
+    array.push(poiTouchedA, false)
+    array.push(poiReactedA, false)
+    while array.size(poiBox) > maxBoxesIn
+        f_poiRemove(0)
+
+// ============================================================================
+// SECTION 12 — ORDER BLOCK DETECTION
+// ============================================================================
+// Bullish OB = last bearish candle(s) (up to obLookback, consecutive) before
+// a bullish displacement or bullish BOS.  Bearish OB is the mirror.
+f_obRange(int dir) =>
+    float top = na
+    float bot = na
+    int   firstBar = na
+    int   found = 0
+    bool  stop = false
+    for k = 1 to 10
+        if stop
+            break
+        bool opp = dir == 1 ? close[k] < open[k] : close[k] > open[k]
+        if found == 0
+            if opp
+                top := high[k]
+                bot := low[k]
+                firstBar := bar_index - k
+                found := 1
+        else
+            if opp and found < obLookback
+                top := math.max(top, high[k])
+                bot := math.min(bot, low[k])
+                firstBar := bar_index - k
+                found += 1
+            else
+                stop := true
+    [top, bot, firstBar]
+
+var int lastBullObBar = na
+var int lastBearObBar = na
+
+if tfOk and confirmed and showOB
+    if bullBosNow or isDispUp
+        [obTop, obBot, obBar] = f_obRange(1)
+        if not na(obTop) and (na(lastBullObBar) or obBar != lastBullObBar)
+            isSetup = not na(bullArmedUntil) and bar_index <= bullArmedUntil
+            f_poiAdd(1, obTop, obBot, obBar, "Bullish OB", COL_OB_BULL, COL_BULL, isSetup)
+            lastBullObBar := obBar
+            aBullOB := true
+    if bearBosNow or isDispDown
+        [obTop, obBot, obBar] = f_obRange(-1)
+        if not na(obTop) and (na(lastBearObBar) or obBar != lastBearObBar)
+            isSetup = not na(bearArmedUntil) and bar_index <= bearArmedUntil
+            f_poiAdd(-1, obTop, obBot, obBar, "Bearish OB", COL_OB_BEAR, COL_BEAR, isSetup)
+            lastBearObBar := obBar
+            aBearOB := true
+
+// ============================================================================
+// SECTION 13 — FAIR VALUE GAP DETECTION (standard 3-candle logic)
+// ============================================================================
+if tfOk and confirmed and showFVG
+    if low > high[2]                                    // bullish FVG
+        isSetup = not na(bullArmedUntil) and bar_index <= bullArmedUntil
+        f_poiAdd(2, low, high[2], bar_index - 1, "Bullish FVG", COL_FVG_BULL, color.blue, isSetup)
+        aBullFVG := true
+    if high < low[2]                                    // bearish FVG
+        isSetup = not na(bearArmedUntil) and bar_index <= bearArmedUntil
+        f_poiAdd(-2, low[2], high, bar_index - 1, "Bearish FVG", COL_FVG_BEAR, color.orange, isSetup)
+        aBearFVG := true
+
+// ============================================================================
+// SECTION 14 — POI MANAGEMENT: expiry, invalidation, entries, reactions,
+//              and the final valid-setup confirmation
+// ============================================================================
+kzName = f_kzName()
+
+if tfOk and confirmed and array.size(poiBox) > 0
+    for i = array.size(poiBox) - 1 to 0
+        if array.get(poiStateA, i) != 0
+            continue
+        typ  = array.get(poiType, i)
+        top  = array.get(poiTopA, i)
+        bot  = array.get(poiBotA, i)
+        bx   = array.get(poiBox, i)
+        bull = typ > 0
+
+        // ── Expiration
+        if usePoiExpiry and bar_index - array.get(poiBornA, i) > poiExpiry
+            array.set(poiStateA, i, 2)
+            if invalidMode == "Delete"
+                f_poiRemove(i)
+            else
+                box.set_bgcolor(bx, COL_FADE)
+                box.set_border_color(bx, color.new(color.gray, 60))
+            continue
+
+        // ── Invalidation: bull POI dies on close below its low; bear on close above its high
+        invalid = bull ? close < bot : close > top
+        if invalid
+            array.set(poiStateA, i, 1)
+            if invalidMode == "Delete"
+                f_poiRemove(i)
+            else
+                box.set_bgcolor(bx, COL_FADE)
+                box.set_border_color(bx, color.new(color.gray, 60))
+                box.set_border_style(bx, line.style_dotted)
+            continue
+
+        // ── Keep active box extended to the current bar
+        box.set_right(bx, bar_index)
+
+        // ── Entry: candle range touches the box
+        entered = low <= top and high >= bot
+        if entered and not array.get(poiTouchedA, i)
+            array.set(poiTouchedA, i, true)
+            if bull
+                aBullEnter := true
+            else
+                aBearEnter := true
+
+        // ── Reaction: candle touches the POI and closes in the POI direction
+        reacting = entered and (bull ? close > open : close < open)
+        if reacting and not array.get(poiReactedA, i)
+            array.set(poiReactedA, i, true)
+            if bull
+                aBullReact := true
+            else
+                aBearReact := true
+            if showLabels
+                f_addLabel(label.new(bar_index, bull ? low : high,
+                     bull ? "POI ▲" : "POI ▼",
+                     style = bull ? label.style_label_up : label.style_label_down,
+                     color = color.new(bull ? COL_BULL : COL_BEAR, 55),
+                     textcolor = color.white, size = size.tiny))
+
+            // ── VALID SETUP: bias → inducement → BOS → POI formed → return → reaction
+            if array.get(poiSetupA, i)
+                biasOk   = bull ? combinedBias == 1 : combinedBias == -1
+                aggrOk   = combinedBias == 0 and aggressiveMode
+                kzOk     = not useKZFilter or inAnyKZ
+                if (biasOk or aggrOk) and kzOk
+                    isAggr = aggrOk and not biasOk
+                    txt = (isAggr ? "Aggressive Setup " : bull ? "Bullish Setup " : "Bearish Setup ")
+                         + (bull ? "▲" : "▼") + "\n(" + kzName + ")"
+                    if showLabels
+                        f_addLabel(label.new(bar_index, bull ? low : high, txt,
+                             style = bull ? label.style_label_up : label.style_label_down,
+                             color = bull ? COL_BULL : COL_BEAR,
+                             textcolor = color.white, size = size.normal))
+                    if isAggr
+                        if bull
+                            aBullAggr := true
+                        else
+                            aBearAggr := true
+                    else
+                        if bull
+                            aBullSetup := true
+                        else
+                            aBearSetup := true
+                    array.set(poiSetupA, i, false)   // fire once per POI
+
+// ============================================================================
+// SECTION 15 — DASHBOARD
+// ============================================================================
+var table dash = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 15),
+     border_width = 1, border_color = color.new(color.gray, 60))
+
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "4H Bias",   text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, use4H ? f_biasTxt(bias4H) : "Off", text_color = f_biasCol(bias4H), text_size = size.small)
+    table.cell(dash, 0, 1, "1H Bias",   text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, use1H ? f_biasTxt(bias1H) : "Off", text_color = f_biasCol(bias1H), text_size = size.small)
+    table.cell(dash, 0, 2, "Bias",      text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 2, f_biasTxt(combinedBias) + " Bias", text_color = f_biasCol(combinedBias), text_size = size.small)
+    table.cell(dash, 0, 3, "Kill Zone", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 3, kzName, text_color = inAnyKZ ? color.yellow : color.gray, text_size = size.small)
+    table.cell(dash, 0, 4, "Aggressive", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 4, aggressiveMode ? "On" : "Off",
+         text_color = aggressiveMode ? color.orange : color.gray, text_size = size.small)
+    table.cell(dash, 0, 5, "KZ Filter", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 5, useKZFilter ? "On" : "Off",
+         text_color = useKZFilter ? color.yellow : color.gray, text_size = size.small)
+
+// ============================================================================
+// SECTION 16 — ALERTS
+// ============================================================================
+alertcondition(aBullInd,   "Bullish inducement detected",     "Bullish inducement detected")
+alertcondition(aBearInd,   "Bearish inducement detected",     "Bearish inducement detected")
+alertcondition(aBullBos,   "Bullish real BOS confirmed",      "Bullish real BOS confirmed")
+alertcondition(aBearBos,   "Bearish real BOS confirmed",      "Bearish real BOS confirmed")
+alertcondition(aBullOB,    "Bullish OB formed",               "Bullish order block formed")
+alertcondition(aBearOB,    "Bearish OB formed",               "Bearish order block formed")
+alertcondition(aBullFVG,   "Bullish FVG formed",              "Bullish fair value gap formed")
+alertcondition(aBearFVG,   "Bearish FVG formed",              "Bearish fair value gap formed")
+alertcondition(aBullEnter, "Price entering bullish POI",      "Price entering a bullish POI")
+alertcondition(aBearEnter, "Price entering bearish POI",      "Price entering a bearish POI")
+alertcondition(aBullReact, "Price reacting from bullish POI", "Price reacting from a bullish POI")
+alertcondition(aBearReact, "Price reacting from bearish POI", "Price reacting from a bearish POI")
+alertcondition(aBullSetup, "Valid bullish setup confirmed",   "Valid bullish setup confirmed")
+alertcondition(aBearSetup, "Valid bearish setup confirmed",   "Valid bearish setup confirmed")
+alertcondition(aBullAggr,  "Aggressive bullish setup",        "Aggressive bullish setup confirmed (mixed bias)")
+alertcondition(aBearAggr,  "Aggressive bearish setup",        "Aggressive bearish setup confirmed (mixed bias)")
+
